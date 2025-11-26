@@ -1,5 +1,7 @@
 // server.js
-// MJPEG-capable relay: devices -> server via WSS (binary frames), clients -> /stream/:id (MJPEG)
+// Complete ESP32-CAM relay server with MJPEG streaming
+// Dependencies: express, ws, body-parser
+// Usage: node server.js   (or deploy to Render/Heroku/VPS)
 
 const express = require("express");
 const http = require("http");
@@ -9,15 +11,20 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.json());
 
+// Simple root page
+app.get("/", (req, res) => {
+  res.send("ESP32-CAM relay running. Use /api/devices or /stream/:id");
+});
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true, path: "/ws" });
 
-// Maps
+// In-memory structures
 const devices = new Map();      // deviceId -> ws
 const lastFrame = new Map();    // deviceId -> Buffer (last jpeg)
 const streamClients = new Map(); // deviceId -> Set<res>
 
-// upgrade handler
+// Upgrade HTTP -> WebSocket at /ws
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -28,16 +35,20 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
 
   ws.on("message", (msg, isBinary) => {
-    // if binary => treat as a JPEG frame (must be associated with ws.deviceId)
+    // If binary frame => treat as JPEG image from device
     if (isBinary) {
       if (!ws.deviceId) return;
       const buf = Buffer.from(msg);
       lastFrame.set(ws.deviceId, buf);
+
+      // debug log
+      console.log(`binary frame received from ${ws.deviceId}, ${buf.length} bytes`);
+
       // push to all HTTP clients subscribed to stream
       const clients = streamClients.get(ws.deviceId);
       if (clients) {
@@ -49,18 +60,19 @@ wss.on("connection", (ws) => {
             res.write(buf);
             res.write(`\r\n`);
           } catch (e) {
-            // likely client disconnected unexpectedly
+            // remove broken client
             clients.delete(res);
-            try { res.end(); } catch (er){}
+            try { res.end(); } catch (er) {}
           }
         }
       }
       return;
     }
 
-    // text messages (json)
+    // text JSON messages
     try {
       const json = JSON.parse(msg.toString());
+      // handshake from device
       if (json.type === "hello" && json.deviceId) {
         ws.deviceId = json.deviceId;
         devices.set(json.deviceId, ws);
@@ -68,14 +80,18 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({ type: "hello_ack" }));
         return;
       }
-      // device can also send JSON frame responses (legacy)
+
+      // device might send a base64 snapshot (legacy)
       if (json.type === "frame" && json.reqId && json.data) {
-        // base64 frame (legacy snapshot). store as Buffer
-        const buf = Buffer.from(json.data, "base64");
-        lastFrame.set(ws.deviceId, buf);
-        // handle pending snapshot logic if you implemented it elsewhere
+        if (ws.deviceId) {
+          const buf = Buffer.from(json.data, "base64");
+          lastFrame.set(ws.deviceId, buf);
+          console.log(`base64 frame stored for ${ws.deviceId}, ${buf.length} bytes`);
+        }
         return;
       }
+
+      // handle other JSON messages if needed
     } catch (e) {
       console.error("Invalid WS message:", e);
     }
@@ -88,9 +104,13 @@ wss.on("connection", (ws) => {
       console.log("Device disconnected:", ws.deviceId);
     }
   });
+
+  ws.on("error", (err) => {
+    console.error("WS error:", err && err.message ? err.message : err);
+  });
 });
 
-// ping/pong health
+// ping/pong keepalive
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
@@ -100,7 +120,7 @@ setInterval(() => {
 }, 30000);
 
 /* ===========================
-    HTTP API: MJPEG stream endpoint
+    HTTP: MJPEG stream endpoint
    =========================== */
 app.get("/stream/:id", (req, res) => {
   const id = req.params.id;
@@ -111,7 +131,7 @@ app.get("/stream/:id", (req, res) => {
     "Connection": "keep-alive"
   });
 
-  // send last frame quickly (if any)
+  // Immediately send last frame if available
   const l = lastFrame.get(id);
   if (l) {
     res.write(`--frame\r\n`);
@@ -120,33 +140,35 @@ app.get("/stream/:id", (req, res) => {
     res.write(l);
     res.write(`\r\n`);
   } else {
-    // optionally request an immediate capture from device
+    // ask device for an immediate capture if it's online
     const ws = devices.get(id);
     if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log(`requesting immediate capture from ${id}`);
       ws.send(JSON.stringify({ cmd: "capture_now" }));
-      // device should send a binary frame shortly
+      // device should send a binary frame soon
     }
   }
 
-  // register client
+  // register this response as a subscriber
   if (!streamClients.has(id)) streamClients.set(id, new Set());
   const clients = streamClients.get(id);
   clients.add(res);
 
-  // on client close, remove from set
   req.on("close", () => {
     clients.delete(res);
   });
 });
 
 /* ===========================
-    HTTP API: List Devices and snapshot fallback
+    HTTP: API endpoints
    =========================== */
+
+// list online devices
 app.get("/api/devices", (req, res) => {
   res.json({ online: Array.from(devices.keys()) });
 });
 
-// snapshot endpoint: return lastFrame if exists, else ask device for one (simple fallback)
+// snapshot: return last frame or request one
 app.post("/api/device/:id/capture", async (req, res) => {
   const id = req.params.id;
   const ws = devices.get(id);
@@ -159,38 +181,43 @@ app.post("/api/device/:id/capture", async (req, res) => {
     return res.status(404).json({ error: "device_offline" });
   }
 
-  // wait for next binary frame (one-time)
-  let done = false;
-  const handler = (buffer) => {
-    if (done) return;
-    done = true;
-    res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": buffer.length });
-    res.end(buffer);
-  };
-
-  // temporarly listen for next frame by monkey-patching lastFrame change: simplest approach is to wait up to 6s polling
-  const timeout = setTimeout(() => {
-    if (!done) {
-      done = true;
-      res.status(504).json({ error: "timeout" });
-    }
-  }, 6000);
-
-  // ask device for immediate capture
+  // ask device for capture and wait up to 6s
   ws.send(JSON.stringify({ cmd: "capture_now" }));
 
-  // poll for lastFrame change (cheap and safe)
   const start = Date.now();
+  const timeoutMs = 6000;
   const interval = setInterval(() => {
     const f = lastFrame.get(id);
     if (f && f.length > 0) {
       clearInterval(interval);
-      clearTimeout(timeout);
-      if (!done) handler(f);
-    } else if (Date.now() - start > 6000) {
+      res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": f.length });
+      return res.end(f);
+    }
+    if (Date.now() - start > timeoutMs) {
       clearInterval(interval);
+      return res.status(504).json({ error: "timeout" });
     }
   }, 250);
+});
+
+// start/stop stream via server (sends WS cmd to device)
+app.post("/api/device/:id/stream", (req, res) => {
+  const id = req.params.id;
+  const action = (req.query.action || "").toLowerCase();
+  const ws = devices.get(id);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return res.status(404).json({ error: "device_offline" });
+
+  if (action === "start") {
+    ws.send(JSON.stringify({ cmd: "start_stream" }));
+    console.log(`asked ${id} to start_stream`);
+    return res.json({ ok: true, started: true });
+  } else if (action === "stop") {
+    ws.send(JSON.stringify({ cmd: "stop_stream" }));
+    console.log(`asked ${id} to stop_stream`);
+    return res.json({ ok: true, stopped: true });
+  } else {
+    return res.status(400).json({ error: "invalid_action" });
+  }
 });
 
 /* ===========================
@@ -200,4 +227,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
-
