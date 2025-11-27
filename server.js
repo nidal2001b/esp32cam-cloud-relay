@@ -1,8 +1,5 @@
 // server.js
-// Complete ESP32-CAM relay server with MJPEG streaming
-// Dependencies: express, ws, body-parser
-// Usage: node server.js   (or deploy to Render/Heroku/VPS)
-
+// Complete ESP32-CAM relay server with MJPEG streaming and auto-start on hello
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -11,7 +8,6 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.json());
 
-// Simple root page
 app.get("/", (req, res) => {
   res.send("ESP32-CAM relay running. Use /api/devices or /stream/:id");
 });
@@ -19,12 +15,10 @@ app.get("/", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true, path: "/ws" });
 
-// In-memory structures
 const devices = new Map();      // deviceId -> ws
 const lastFrame = new Map();    // deviceId -> Buffer (last jpeg)
 const streamClients = new Map(); // deviceId -> Set<res>
 
-// Upgrade HTTP -> WebSocket at /ws
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -40,16 +34,11 @@ wss.on("connection", (ws, req) => {
   ws.on("pong", () => (ws.isAlive = true));
 
   ws.on("message", (msg, isBinary) => {
-    // If binary frame => treat as JPEG image from device
     if (isBinary) {
       if (!ws.deviceId) return;
       const buf = Buffer.from(msg);
       lastFrame.set(ws.deviceId, buf);
-
-      // debug log
       console.log(`binary frame received from ${ws.deviceId}, ${buf.length} bytes`);
-
-      // push to all HTTP clients subscribed to stream
       const clients = streamClients.get(ws.deviceId);
       if (clients) {
         for (const res of Array.from(clients)) {
@@ -60,7 +49,6 @@ wss.on("connection", (ws, req) => {
             res.write(buf);
             res.write(`\r\n`);
           } catch (e) {
-            // remove broken client
             clients.delete(res);
             try { res.end(); } catch (er) {}
           }
@@ -69,19 +57,24 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // text JSON messages
     try {
       const json = JSON.parse(msg.toString());
-      // handshake from device
       if (json.type === "hello" && json.deviceId) {
         ws.deviceId = json.deviceId;
         devices.set(json.deviceId, ws);
         console.log("Device connected:", json.deviceId);
         ws.send(JSON.stringify({ type: "hello_ack" }));
+
+        // <<< auto-start stream immediately after handshake
+        try {
+          ws.send(JSON.stringify({ cmd: "start_stream" }));
+          console.log(`sent start_stream to ${json.deviceId}`);
+        } catch (e) {
+          console.error("failed to send start_stream:", e && e.message ? e.message : e);
+        }
         return;
       }
 
-      // device might send a base64 snapshot (legacy)
       if (json.type === "frame" && json.reqId && json.data) {
         if (ws.deviceId) {
           const buf = Buffer.from(json.data, "base64");
@@ -90,18 +83,18 @@ wss.on("connection", (ws, req) => {
         }
         return;
       }
-
-      // handle other JSON messages if needed
     } catch (e) {
       console.error("Invalid WS message:", e);
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
     if (ws.deviceId) {
       devices.delete(ws.deviceId);
       lastFrame.delete(ws.deviceId);
-      console.log("Device disconnected:", ws.deviceId);
+      console.log(`Device disconnected: ${ws.deviceId} (code=${code} reason=${reason})`);
+    } else {
+      console.log(`WS closed (no deviceId) code=${code} reason=${reason}`);
     }
   });
 
@@ -110,7 +103,6 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// ping/pong keepalive
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
@@ -119,9 +111,7 @@ setInterval(() => {
   });
 }, 30000);
 
-/* ===========================
-    HTTP: MJPEG stream endpoint
-   =========================== */
+/* MJPEG stream endpoint */
 app.get("/stream/:id", (req, res) => {
   const id = req.params.id;
   res.writeHead(200, {
@@ -131,7 +121,6 @@ app.get("/stream/:id", (req, res) => {
     "Connection": "keep-alive"
   });
 
-  // Immediately send last frame if available
   const l = lastFrame.get(id);
   if (l) {
     res.write(`--frame\r\n`);
@@ -140,16 +129,13 @@ app.get("/stream/:id", (req, res) => {
     res.write(l);
     res.write(`\r\n`);
   } else {
-    // ask device for an immediate capture if it's online
     const ws = devices.get(id);
     if (ws && ws.readyState === WebSocket.OPEN) {
       console.log(`requesting immediate capture from ${id}`);
       ws.send(JSON.stringify({ cmd: "capture_now" }));
-      // device should send a binary frame soon
     }
   }
 
-  // register this response as a subscriber
   if (!streamClients.has(id)) streamClients.set(id, new Set());
   const clients = streamClients.get(id);
   clients.add(res);
@@ -159,17 +145,12 @@ app.get("/stream/:id", (req, res) => {
   });
 });
 
-/* ===========================
-    HTTP: API endpoints
-   =========================== */
-
-// list online devices
+/* API endpoints */
 app.get("/api/devices", (req, res) => {
   res.json({ online: Array.from(devices.keys()) });
 });
 
-// snapshot: return last frame or request one
-app.post("/api/device/:id/capture", async (req, res) => {
+app.post("/api/device/:id/capture", (req, res) => {
   const id = req.params.id;
   const ws = devices.get(id);
   const cached = lastFrame.get(id);
@@ -181,7 +162,6 @@ app.post("/api/device/:id/capture", async (req, res) => {
     return res.status(404).json({ error: "device_offline" });
   }
 
-  // ask device for capture and wait up to 6s
   ws.send(JSON.stringify({ cmd: "capture_now" }));
 
   const start = Date.now();
@@ -200,7 +180,6 @@ app.post("/api/device/:id/capture", async (req, res) => {
   }, 250);
 });
 
-// start/stop stream via server (sends WS cmd to device)
 app.post("/api/device/:id/stream", (req, res) => {
   const id = req.params.id;
   const action = (req.query.action || "").toLowerCase();
@@ -220,9 +199,6 @@ app.post("/api/device/:id/stream", (req, res) => {
   }
 });
 
-/* ===========================
-    Start server
-   =========================== */
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log("Server running on port", PORT);
