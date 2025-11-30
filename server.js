@@ -1,299 +1,178 @@
 // server.js
 const express = require('express');
 const bodyParser = require('body-parser');
-const admin = require('firebase-admin');
-const nodemailer = require('nodemailer');
-const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
-const helmet = require('helmet');
+const WebSocket = require('ws');
+const sgMail = require('@sendgrid/mail');
+
+const PORT = process.env.PORT || 8080;      // HTTP API
+const WS_PORT = process.env.WS_PORT || 8081; // WebSocket relay
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const FROM_EMAIL = process.env.FROM_EMAIL; // e.g., "no-reply@yourdomain.com"
+const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+if (!SENDGRID_API_KEY || !FROM_EMAIL) {
+  console.error("Please set SENDGRID_API_KEY and FROM_EMAIL env variables.");
+  process.exit(1);
+}
+
+sgMail.setApiKey(SENDGRID_API_KEY);
 
 const app = express();
 app.use(bodyParser.json());
 app.use(cors());
-app.use(helmet());
 
-// ---------- CONFIG via ENV ----------
-const PORT = process.env.PORT || 3000;
-const SERVICE_ACCOUNT_PATH = process.env.SERVICE_ACCOUNT_PATH || null; // path to JSON file (or null)
-const SERVICE_ACCOUNT_JSON = process.env.SERVICE_ACCOUNT_JSON || null; // base64 JSON string alternative
-const DB_URL = process.env.DB_URL || 'https://your-db.firebaseio.com'; // realtime db url
-const EMAIL_FROM = process.env.EMAIL_FROM || 'your@gmail.com';
-const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || process.env.EMAIL_FROM;
-const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || null;
-const OTP_TTL_MS = parseInt(process.env.OTP_TTL_MS || String(2 * 60 * 1000)); // default 2 minutes
-const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || String(15 * 60 * 1000)); // default 15 minutes
-const RELAY_API_URL = process.env.RELAY_API_URL || ''; // optional: call to relay to forward start/stop
+// In-memory stores
+const otps = new Map();     // deviceId -> { otp, email, expiresAt, attempts }
+const sessions = new Map(); // deviceId -> { token, email, expiresAt }
 
-// ---------- init Firebase Admin ----------
-let serviceAccount;
-if (SERVICE_ACCOUNT_JSON) {
-  // assume base64 or raw JSON string
-  try {
-    const jsonStr = Buffer.from(SERVICE_ACCOUNT_JSON, 'base64').toString();
-    serviceAccount = JSON.parse(jsonStr);
-  } catch (e) {
-    console.error('Failed parse SERVICE_ACCOUNT_JSON', e);
-    process.exit(1);
-  }
-} else if (SERVICE_ACCOUNT_PATH) {
-  serviceAccount = require(SERVICE_ACCOUNT_PATH);
-} else {
-  console.error('Provide SERVICE_ACCOUNT_PATH or SERVICE_ACCOUNT_JSON env var');
-  process.exit(1);
-}
+// WebSocket server (relay)
+const wss = new WebSocket.Server({ port: WS_PORT });
+console.log("WebSocket server listening on port", WS_PORT);
+const clients = new Map(); // deviceId -> ws
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: DB_URL
+wss.on('connection', (ws) => {
+  console.log('WS client connected');
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  ws.on('message', (message) => {
+    try {
+      const msg = JSON.parse(message.toString());
+      if (msg.type === 'hello' && msg.deviceId) {
+        clients.set(msg.deviceId, ws);
+        ws.deviceId = msg.deviceId;
+        console.log('Registered deviceId on WS:', msg.deviceId);
+      } else {
+        console.log('WS recv:', msg);
+      }
+    } catch (e) {
+      console.log('Invalid WS message', e);
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.deviceId) clients.delete(ws.deviceId);
+    console.log('WS closed');
+  });
 });
 
-const db = admin.database();
+// keepalive
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
 
-// ---------- init nodemailer ----------
-if (!EMAIL_SMTP_PASS) {
-  console.warn('EMAIL_SMTP_PASS not set — emails will fail unless SMTP credentials provided');
-}
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: EMAIL_SMTP_USER,
-    pass: EMAIL_SMTP_PASS
-  }
-});
-
-// ---------- Helpers ----------
-function genOtp6() {
+function genOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
-
-function nowMs() {
-  return Date.now();
+function genToken() {
+  return [...Array(32)].map(() => Math.random().toString(36)[2]).join('');
 }
 
-// ---------- Endpoints ----------
+// POST /request_otp
+app.post('/request_otp', async (req, res) => {
+  const { deviceId, email } = req.body || {};
+  if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId and email required' });
 
-/**
- * Register device (called by ESP after provisioning)
- * body: { deviceId, ownerEmail, requireOtp (bool) }
- */
-app.post('/register_device', async (req, res) => {
+  // rate limiting simple check
+  const prev = otps.get(deviceId);
+  if (prev && Date.now() < (prev.expiresAt - (OTP_TTL_MS - 1000))) {
+    // if already requested recently, refuse (simple)
+    return res.status(429).json({ ok:false, error:'OTP recently requested. Wait a bit.' });
+  }
+
+  const otp = genOtp();
+  const expiresAt = Date.now() + OTP_TTL_MS;
+  otps.set(deviceId, { otp, email, expiresAt, attempts:0 });
+
+  const msg = {
+    to: email,
+    from: FROM_EMAIL,
+    subject: `Your OTP for device ${deviceId}`,
+    text: `Your OTP code is ${otp}. It is valid for 5 minutes.`
+  };
+
   try {
-    const { deviceId, ownerEmail, requireOtp } = req.body;
-    if (!deviceId || !ownerEmail) return res.status(400).json({ error: 'deviceId and ownerEmail required' });
-
-    const path = `devices/${deviceId}`;
-    const payload = {
-      ownerEmail,
-      requireOtp: !!requireOtp,
-      createdAt: nowMs(),
-      // fields for OTP/session flow
-      otp: '',
-      otpExpiresAt: 0,
-      sessionToken: '',
-      sessionExpiresAt: 0,
-      streamRequested: false
-    };
-
-    await db.ref(path).set(payload);
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('register_device error', e);
-    return res.status(500).json({ error: 'server_error', details: e.message });
+    await sgMail.send(msg);
+    console.log('OTP sent to', email, 'for device', deviceId);
+    return res.json({ ok:true });
+  } catch (err) {
+    console.error('SendGrid error', err);
+    return res.status(500).json({ ok:false, error:'failed to send email' });
   }
 });
 
-/**
- * Request OTP — server generates OTP and emails it to ownerEmail from DB.
- * body: { deviceId }
- */
-app.post('/request-otp', async (req, res) => {
+// POST /verify_otp
+app.post('/verify_otp', (req, res) => {
+  const { deviceId, email, otp } = req.body || {};
+  if (!deviceId || !email || !otp) return res.status(400).json({ ok:false, error:'deviceId,email,otp required' });
+
+  const rec = otps.get(deviceId);
+  if (!rec) return res.status(403).json({ ok:false, error:'no otp for device' });
+  if (rec.email !== email) return res.status(403).json({ ok:false, error:'email mismatch' });
+  if (Date.now() > rec.expiresAt) { otps.delete(deviceId); return res.status(403).json({ ok:false, error:'otp expired' }); }
+
+  // increase attempts and limit
+  rec.attempts = (rec.attempts || 0) + 1;
+  if (rec.attempts > 6) { otps.delete(deviceId); return res.status(403).json({ ok:false, error:'too many attempts' }); }
+
+  if (rec.otp !== otp) return res.status(403).json({ ok:false, error:'invalid otp' });
+
+  // success -> create session & delete otp
+  const token = genToken();
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  sessions.set(deviceId, { token, email, expiresAt });
+  otps.delete(deviceId);
+
+  // push auth_grant via WS if device connected
+  const ws = clients.get(deviceId);
+  const payload = { type: 'auth_grant', deviceId, email, token, ttl_ms: SESSION_TTL_MS };
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+    console.log('Sent auth_grant to device', deviceId);
+  } else {
+    console.log('Device not connected; session stored on server for later (device will get token when reconnected if needed).');
+  }
+
+  return res.json({ ok:true, token, expires_ms: SESSION_TTL_MS });
+});
+
+// POST /command -> verify token on server-side then forward to device via WS
+app.post('/command', (req, res) => {
+  const { deviceId, email, token, cmd } = req.body || {};
+  if (!deviceId || !email || !token || !cmd) return res.status(400).json({ ok:false, error:'deviceId,email,token,cmd required' });
+  const sess = sessions.get(deviceId);
+  if (!sess) return res.status(403).json({ ok:false, error:'no session for device' });
+  if (sess.email !== email) return res.status(403).json({ ok:false, error:'email mismatch' });
+  if (sess.token !== token) return res.status(403).json({ ok:false, error:'invalid token' });
+  if (Date.now() > sess.expiresAt) { sessions.delete(deviceId); return res.status(403).json({ ok:false, error:'session expired' }); }
+
+  const ws = clients.get(deviceId);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return res.status(500).json({ ok:false, error:'device not connected' });
+
+  const out = { type: 'cmd', payload: { cmd, email, token } };
   try {
-    const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    const devSnap = await db.ref(`devices/${deviceId}`).once('value');
-    if (!devSnap.exists()) return res.status(404).json({ error: 'device not found' });
-
-    const dev = devSnap.val();
-    const ownerEmail = dev.ownerEmail;
-    if (!ownerEmail) return res.status(400).json({ error: 'ownerEmail not configured' });
-
-    // generate OTP and store as a child node (keeps history) AND write latest fields for compatibility
-    const otp = genOtp6();
-    const createdAt = nowMs();
-    const expiresAt = createdAt + OTP_TTL_MS;
-
-    // push under view_otps/{deviceId}/{pushId}
-    const pushRef = db.ref(`view_otps/${deviceId}`).push();
-    await pushRef.set({
-      otp,
-      createdAt,
-      expiresAt,
-      used: false
-    });
-
-    // Also store last-otp fields (optional, for devices that read single path)
-    await db.ref(`devices/${deviceId}`).update({
-      otp: otp,
-      otpExpiresAt: expiresAt
-    });
-
-    // send email
-    const mailOptions = {
-      from: EMAIL_FROM,
-      to: ownerEmail,
-      subject: `Your camera OTP (${deviceId})`,
-      text: `Your OTP to view camera ${deviceId} is: ${otp}\nIt expires in ${Math.round(OTP_TTL_MS / 1000)} seconds.`
-    };
-
-    await transporter.sendMail(mailOptions);
-
-    return res.json({ ok: true, expiresAt });
+    ws.send(JSON.stringify(out));
+    return res.json({ ok:true });
   } catch (e) {
-    console.error('request-otp error', e);
-    return res.status(500).json({ error: 'server_error', details: e.message });
+    console.error('Failed to send cmd', e);
+    return res.status(500).json({ ok:false, error:'failed to forward cmd' });
   }
 });
 
-/**
- * Verify OTP -> create session token
- * body: { deviceId, otp }
- */
-app.post('/verify-otp', async (req, res) => {
-  try {
-    const { deviceId, otp } = req.body;
-    if (!deviceId || !otp) return res.status(400).json({ error: 'deviceId and otp required' });
-
-    // search for a non-used, non-expired OTP under view_otps/{deviceId}
-    const otpsSnap = await db.ref(`view_otps/${deviceId}`).orderByChild('otp').equalTo(otp).once('value');
-    if (!otpsSnap.exists()) return res.status(401).json({ error: 'invalid_otp' });
-
-    // find matching record that is not used and not expired
-    let matchedKey = null;
-    let matchedVal = null;
-    otpsSnap.forEach(child => {
-      const v = child.val();
-      if (!v.used && v.expiresAt && v.expiresAt > nowMs()) {
-        matchedKey = child.key;
-        matchedVal = v;
-      }
-    });
-
-    if (!matchedKey) return res.status(401).json({ error: 'invalid_or_expired_otp' });
-
-    // mark otp used
-    await db.ref(`view_otps/${deviceId}/${matchedKey}`).update({ used: true, usedAt: nowMs() });
-
-    // create session token
-    const token = uuidv4(); // random UUID
-    const createdAt = nowMs();
-    const expiresAt = createdAt + SESSION_TTL_MS;
-
-    const sessionObj = {
-      deviceId,
-      createdAt,
-      expiresAt,
-      used: false
-    };
-
-    await db.ref(`sessions/${token}`).set(sessionObj);
-
-    // optionally write current session on device node
-    await db.ref(`devices/${deviceId}`).update({
-      sessionToken: token,
-      sessionExpiresAt: expiresAt
-    });
-
-    return res.json({ ok: true, sessionToken: token, expiresAt });
-  } catch (e) {
-    console.error('verify-otp error', e);
-    return res.status(500).json({ error: 'server_error', details: e.message });
-  }
+// POST /revoke (optional)
+app.post('/revoke', (req, res) => {
+  const { deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ ok:false, error:'deviceId required' });
+  sessions.delete(deviceId);
+  const ws = clients.get(deviceId);
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'revoke' }));
+  return res.json({ ok:true });
 });
 
-/**
- * Use session token to request start-stream
- * body: { deviceId, sessionToken }
- */
-app.post('/start-stream', async (req, res) => {
-  try {
-    const { deviceId, sessionToken } = req.body;
-    if (!deviceId || !sessionToken) return res.status(400).json({ error: 'deviceId and sessionToken required' });
-
-    const sSnap = await db.ref(`sessions/${sessionToken}`).once('value');
-    if (!sSnap.exists()) return res.status(401).json({ error: 'invalid_session' });
-
-    const s = sSnap.val();
-    if (s.used) return res.status(401).json({ error: 'session_used' });
-    if (s.deviceId !== deviceId) return res.status(401).json({ error: 'session_device_mismatch' });
-    if (s.expiresAt < nowMs()) return res.status(401).json({ error: 'session_expired' });
-
-    // mark session as used (single-use) OR keep used=false depending on behavior
-    await db.ref(`sessions/${sessionToken}`).update({ used: true, usedAt: nowMs() });
-
-    // set device streamRequested true (camera polls DB per our esp code)
-    await db.ref(`devices/${deviceId}`).update({
-      streamRequested: true,
-      sessionToken: sessionToken // device can read this to validate
-    });
-
-    // optional: if you have RELAY_API_URL, call it to instruct relay to send start_stream to camera
-    if (RELAY_API_URL) {
-      try {
-        const fetch = require('node-fetch');
-        await fetch(RELAY_API_URL + '/command', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceId, cmd: 'start_stream', sessionToken })
-        });
-      } catch (e) {
-        console.warn('relay API call failed', e.message);
-      }
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('start-stream error', e);
-    return res.status(500).json({ error: 'server_error', details: e.message });
-  }
-});
-
-/**
- * Stop stream (optional) - invalidates device streamRequested
- * body: { deviceId }
- */
-app.post('/stop-stream', async (req, res) => {
-  try {
-    const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
-    await db.ref(`devices/${deviceId}`).update({ streamRequested: false });
-
-    // optional relay call
-    if (RELAY_API_URL) {
-      try {
-        const fetch = require('node-fetch');
-        await fetch(RELAY_API_URL + '/command', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceId, cmd: 'stop_stream' })
-        });
-      } catch (e) {
-        console.warn('relay API call failed', e.message);
-      }
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('stop-stream error', e);
-    return res.status(500).json({ error: 'server_error', details: e.message });
-  }
-});
-
-// health
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// ---------- start ----------
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`HTTP API listening on port ${PORT}`));
