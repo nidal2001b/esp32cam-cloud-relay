@@ -2,18 +2,18 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const http = require('http');
 const WebSocket = require('ws');
 const sgMail = require('@sendgrid/mail');
 
-const PORT = process.env.PORT || 8080;      // HTTP API
-const WS_PORT = process.env.WS_PORT || 8081; // WebSocket relay
+const PORT = process.env.PORT || 8080;
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
-const FROM_EMAIL = process.env.FROM_EMAIL; // e.g., "no-reply@yourdomain.com"
-const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const FROM_EMAIL = process.env.FROM_EMAIL; // e.g. "no-reply@yourdomain.com"
+const OTP_TTL_MS = 5 * 60 * 1000; // 5 min
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
 
 if (!SENDGRID_API_KEY || !FROM_EMAIL) {
-  console.error("Please set SENDGRID_API_KEY and FROM_EMAIL env variables.");
+  console.error('Please set SENDGRID_API_KEY and FROM_EMAIL env variables.');
   process.exit(1);
 }
 
@@ -23,16 +23,17 @@ const app = express();
 app.use(bodyParser.json());
 app.use(cors());
 
-// In-memory stores
+// in-memory stores (for POC; use Redis in production)
 const otps = new Map();     // deviceId -> { otp, email, expiresAt, attempts }
 const sessions = new Map(); // deviceId -> { token, email, expiresAt }
 
-// WebSocket server (relay)
-const wss = new WebSocket.Server({ port: WS_PORT });
-console.log("WebSocket server listening on port", WS_PORT);
+// create HTTP server and attach ws to same server (Render uses one port and provides TLS)
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
 const clients = new Map(); // deviceId -> ws
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   console.log('WS client connected');
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -58,7 +59,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// keepalive
+// ping/pong keepalive
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
@@ -79,10 +80,8 @@ app.post('/request_otp', async (req, res) => {
   const { deviceId, email } = req.body || {};
   if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId and email required' });
 
-  // rate limiting simple check
   const prev = otps.get(deviceId);
   if (prev && Date.now() < (prev.expiresAt - (OTP_TTL_MS - 1000))) {
-    // if already requested recently, refuse (simple)
     return res.status(429).json({ ok:false, error:'OTP recently requested. Wait a bit.' });
   }
 
@@ -117,32 +116,30 @@ app.post('/verify_otp', (req, res) => {
   if (rec.email !== email) return res.status(403).json({ ok:false, error:'email mismatch' });
   if (Date.now() > rec.expiresAt) { otps.delete(deviceId); return res.status(403).json({ ok:false, error:'otp expired' }); }
 
-  // increase attempts and limit
   rec.attempts = (rec.attempts || 0) + 1;
   if (rec.attempts > 6) { otps.delete(deviceId); return res.status(403).json({ ok:false, error:'too many attempts' }); }
 
   if (rec.otp !== otp) return res.status(403).json({ ok:false, error:'invalid otp' });
 
-  // success -> create session & delete otp
   const token = genToken();
   const expiresAt = Date.now() + SESSION_TTL_MS;
   sessions.set(deviceId, { token, email, expiresAt });
   otps.delete(deviceId);
 
-  // push auth_grant via WS if device connected
+  // push auth_grant to device via ws if connected
   const ws = clients.get(deviceId);
   const payload = { type: 'auth_grant', deviceId, email, token, ttl_ms: SESSION_TTL_MS };
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
     console.log('Sent auth_grant to device', deviceId);
   } else {
-    console.log('Device not connected; session stored on server for later (device will get token when reconnected if needed).');
+    console.log('Device not connected; session stored on server for later.');
   }
 
   return res.json({ ok:true, token, expires_ms: SESSION_TTL_MS });
 });
 
-// POST /command -> verify token on server-side then forward to device via WS
+// POST /command
 app.post('/command', (req, res) => {
   const { deviceId, email, token, cmd } = req.body || {};
   if (!deviceId || !email || !token || !cmd) return res.status(400).json({ ok:false, error:'deviceId,email,token,cmd required' });
@@ -165,7 +162,7 @@ app.post('/command', (req, res) => {
   }
 });
 
-// POST /revoke (optional)
+// optional revoke
 app.post('/revoke', (req, res) => {
   const { deviceId } = req.body || {};
   if (!deviceId) return res.status(400).json({ ok:false, error:'deviceId required' });
@@ -175,4 +172,10 @@ app.post('/revoke', (req, res) => {
   return res.json({ ok:true });
 });
 
-app.listen(PORT, () => console.log(`HTTP API listening on port ${PORT}`));
+// health
+app.get('/health', (req, res) => res.json({ ok:true }));
+
+// start server
+server.listen(PORT, () => {
+  console.log(`HTTP + WS server listening on port ${PORT}`);
+});
