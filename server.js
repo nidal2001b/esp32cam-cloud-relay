@@ -10,7 +10,7 @@ const admin = require('firebase-admin');
 const WebSocket = require('ws');
 const sgMail = require('@sendgrid/mail');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 10000;
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
 const FROM_EMAIL = process.env.FROM_EMAIL;
 const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON; // JSON string or path
@@ -103,14 +103,35 @@ app.post('/command', async (req, res) => {
   if (!deviceId || !email || !token || !cmd) return res.status(400).json({ ok:false, error:'missing' });
   const sess = sessions.get(deviceId);
   if (!sess || sess.email !== email || sess.token !== token || Date.now() > sess.expiresAt) {
-    return res.status(403).json({ ok:false, error:'invalid session' });
+    // as a fallback, also check DB session (in case memory was cleared)
+    try {
+      const snap = await db.ref(`/devices/${deviceId}/live/session`).once('value');
+      const dbSess = snap.val();
+      if (dbSess && dbSess.email === email && dbSess.token === token && Date.now() < (dbSess.expiresAt || 0)) {
+        // sync into memory
+        sessions.set(deviceId, { token: dbSess.token, email: dbSess.email, expiresAt: dbSess.expiresAt });
+      } else {
+        return res.status(403).json({ ok:false, error:'invalid session' });
+      }
+    } catch (e) {
+      console.error('Error while validating session from DB:', e);
+      return res.status(500).json({ ok:false, error:'internal' });
+    }
   }
   const cam = clients.get(deviceId);
-  if (!cam || cam.readyState !== WebSocket.OPEN) return res.status(500).json({ ok:false, error:'camera not connected' });
-  cam.send(JSON.stringify({ type:'cmd', payload:{ cmd, email, token } }));
-  return res.json({ ok:true });
+  if (!cam || cam.readyState !== WebSocket.OPEN) {
+    return res.status(500).json({ ok:false, error:'camera not connected' });
+  }
+  try {
+    cam.send(JSON.stringify({ type:'cmd', payload:{ cmd, email, token } }));
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error('Error sending command to camera', e);
+    return res.status(500).json({ ok:false, error: String(e) });
+  }
 });
 
+// create server + ws
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
@@ -120,53 +141,110 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => ws.isAlive = true);
 
   ws.on('message', (msg) => {
-    // text messages are JSON control; binary are frames from camera
-    if (typeof msg === 'string') {
+    // handle messages - use a small async wrapper to allow awaits
+    (async function handleMessage() {
       try {
-        const obj = JSON.parse(msg);
-        if (obj.type === 'hello' && obj.deviceId && obj.role) {
-          ws.deviceId = obj.deviceId;
-          ws.role = obj.role;
-          if (obj.role === 'camera') {
-            clients.set(obj.deviceId, ws);
-            console.log(`Camera connected: ${obj.deviceId}`);
-          } else if (obj.role === 'viewer') {
-            let s = viewers.get(obj.deviceId);
-            if (!s) { s = new Set(); viewers.set(obj.deviceId, s); }
-            s.add(ws);
-            console.log(`Viewer connected for ${obj.deviceId}`);
+        if (typeof msg === 'string') {
+          // debug print
+          try { console.log('WS text received:', msg); } catch(e){}
+          let obj;
+          try {
+            obj = JSON.parse(msg);
+          } catch (e) {
+            console.log('WS: invalid JSON text message:', e);
+            return;
           }
-          return;
-        } else if (obj.type === 'control' && ws.role === 'viewer') {
-          // optional: forward viewer control to camera
-          const cam = clients.get(obj.deviceId);
-          if (cam && cam.readyState === WebSocket.OPEN) cam.send(JSON.stringify(obj));
-          return;
+
+          if (obj.type === 'hello' && obj.deviceId && obj.role) {
+            ws.deviceId = obj.deviceId;
+            ws.role = obj.role;
+
+            if (obj.role === 'camera') {
+              clients.set(obj.deviceId, ws);
+              console.log(`Camera connected (hello): ${obj.deviceId}`);
+
+              // --- NEW: check DB for existing session and push auth_grant if present ---
+              try {
+                const sessSnap = await db.ref(`/devices/${obj.deviceId}/live/session`).once('value');
+                const sess = sessSnap.val();
+                if (sess && sess.token && sess.email && sess.expiresAt && Date.now() < (sess.expiresAt || 0)) {
+                  const ttl = Math.max(0, sess.expiresAt - Date.now());
+                  const payload = {
+                    type: 'auth_grant',
+                    deviceId: obj.deviceId,
+                    email: sess.email,
+                    token: sess.token,
+                    ttl_ms: ttl
+                  };
+                  try {
+                    ws.send(JSON.stringify(payload));
+                    console.log(`Pushed stored auth_grant to camera ${obj.deviceId} (session from DB).`);
+                    // sync into memory
+                    sessions.set(obj.deviceId, { token: sess.token, email: sess.email, expiresAt: sess.expiresAt });
+                  } catch (e) {
+                    console.error('Failed sending auth_grant to camera after hello:', e);
+                  }
+                } else {
+                  console.log(`No valid stored session in DB for ${obj.deviceId} (or expired).`);
+                }
+              } catch (e) {
+                console.error('Error while checking/pushing stored session to camera:', e);
+              }
+
+            } else if (obj.role === 'viewer') {
+              let s = viewers.get(obj.deviceId);
+              if (!s) { s = new Set(); viewers.set(obj.deviceId, s); }
+              s.add(ws);
+              console.log(`Viewer connected for ${obj.deviceId}`);
+            }
+            return;
+          } else if (obj.type === 'control' && ws.role === 'viewer') {
+            // optional: forward viewer control to camera
+            const cam = clients.get(obj.deviceId);
+            if (cam && cam.readyState === WebSocket.OPEN) cam.send(JSON.stringify(obj));
+            return;
+          } else if (obj.type === 'auth_grant' && ws.role === 'camera') {
+            // camera may echo or confirm auth, ignore
+            console.log('Camera auth_grant ack or message:', obj);
+            return;
+          }
+        } else {
+          // binary frame from camera -> forward to viewers
+          if (ws.role === 'camera' && ws.deviceId) {
+            const s = viewers.get(ws.deviceId);
+            if (s) {
+              for (const v of s) {
+                if (v.readyState === WebSocket.OPEN) {
+                  try { v.send(msg); } catch(e) { /* ignore single viewer errors */ }
+                }
+              }
+            }
+          }
         }
       } catch (e) {
-        console.log('WS JSON parse error', e);
+        console.error('Error in WS message handler:', e);
       }
-    } else {
-      // binary frame from camera -> forward to viewers
-      if (ws.role === 'camera' && ws.deviceId) {
-        const s = viewers.get(ws.deviceId);
-        if (s) {
-          for (const v of s) {
-            if (v.readyState === WebSocket.OPEN) v.send(msg);
-          }
-        }
-      }
-    }
+    })();
   });
 
   ws.on('close', () => {
     if (ws.role === 'camera' && ws.deviceId) {
-      clients.delete(ws.deviceId);
-      console.log('Camera disconnected', ws.deviceId);
+      // remove camera mapping if current mapped ws matches this ws instance
+      const mapped = clients.get(ws.deviceId);
+      if (mapped === ws) {
+        clients.delete(ws.deviceId);
+        console.log('Camera disconnected', ws.deviceId);
+      } else {
+        // maybe another ws replaced it, just ignore
+      }
     } else if (ws.role === 'viewer' && ws.deviceId) {
       const s = viewers.get(ws.deviceId);
       if (s) s.delete(ws);
     }
+  });
+
+  ws.on('error', (err) => {
+    console.error('WS socket error:', err);
   });
 });
 
@@ -175,7 +253,7 @@ setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
-    ws.ping();
+    try { ws.ping(); } catch(e) {}
   });
 }, 30000);
 
@@ -247,7 +325,10 @@ function watchDevice(deviceId) {
       await db.ref(`/devices/${deviceId}/live/otp_expected`).remove();
       await db.ref(`/devices/${deviceId}/live/otp_expected_expiresAt`).remove();
       await otpVerifyRef.update({ status: 'ok', grantedAt: Date.now() });
+      // also write a small log object for debugging
+      await db.ref(`/devices/${deviceId}/live/logs/${Date.now()}`).set({ event: 'session_created', email: val.email });
       sessions.set(deviceId, { token, email: val.email, expiresAt: expiresAtSession });
+
       // push auth_grant to camera if connected
       const cam = clients.get(deviceId);
       const payload = { type: 'auth_grant', deviceId, email: val.email, token, ttl_ms: ttl };
@@ -272,9 +353,13 @@ devicesRef.on('child_added', (snap) => {
 });
 
 (async () => {
-  const list = await devicesRef.once('value');
-  const v = list.val() || {};
-  Object.keys(v).forEach(deviceId => watchDevice(deviceId));
+  try {
+    const list = await devicesRef.once('value');
+    const v = list.val() || {};
+    Object.keys(v).forEach(deviceId => watchDevice(deviceId));
+  } catch (e) {
+    console.error('Initial device listing failed', e);
+  }
 })().catch(e => console.error('Initial device listing failed', e));
 
 server.listen(PORT, () => {
