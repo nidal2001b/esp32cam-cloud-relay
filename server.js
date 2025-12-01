@@ -1,4 +1,6 @@
-FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL
+// server.js
+// Relay server: Firebase + SendGrid OTP + WebSocket relay
+// Expects env vars: SENDGRID_API_KEY, FROM_EMAIL, FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL
 
 const fs = require('fs');
 const http = require('http');
@@ -27,6 +29,7 @@ try {
   if (SERVICE_ACCOUNT_JSON.trim().startsWith('{')) {
     serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
   } else {
+    // assume it's a path
     serviceAccount = require(SERVICE_ACCOUNT_JSON);
   }
 } catch (e) {
@@ -56,12 +59,20 @@ app.get('/clients', (req, res) => {
 });
 
 // register_device: camera posts deviceId & email after provisioning
+// NOTE: safe update — do not pass undefined into Firebase update()
 app.post('/register_device', async (req, res) => {
+  // debug print incoming body to help trace issues
+  console.log('/register_device payload:', JSON.stringify(req.body));
+
   const { deviceId, email, ssid } = req.body || {};
   if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId,email required' });
   try {
-    await db.ref(/devices/${deviceId}/config).update({ email, ssid, registeredAt: Date.now() });
-    console.log('Registered device', deviceId, email);
+    // build update object without undefined values
+    const updateObj = { email, registeredAt: Date.now() };
+    if (typeof ssid !== 'undefined' && ssid !== null) updateObj.ssid = ssid;
+
+    await db.ref(/devices/${deviceId}/config).update(updateObj);
+    console.log('Registered device', deviceId, email, 'ssid:', (typeof ssid === 'undefined' ? '(undef)' : ssid));
     return res.json({ ok:true });
   } catch (e) {
     console.error('register_device error', e);
