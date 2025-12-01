@@ -38,16 +38,16 @@ wss.on("connection", (ws, req) => {
       if (!ws.deviceId) return;
       const buf = Buffer.from(msg);
       lastFrame.set(ws.deviceId, buf);
-      console.log(binary frame received from ${ws.deviceId}, ${buf.length} bytes);
+      console.log(`binary frame received from ${ws.deviceId}, ${buf.length} bytes`);
       const clients = streamClients.get(ws.deviceId);
       if (clients) {
         for (const res of Array.from(clients)) {
           try {
-            res.write(--frame\r\n);
-            res.write(Content-Type: image/jpeg\r\n);
-            res.write(Content-Length: ${buf.length}\r\n\r\n);
+            res.write(`--frame\r\n`);
+            res.write(`Content-Type: image/jpeg\r\n`);
+            res.write(`Content-Length: ${buf.length}\r\n\r\n`);
             res.write(buf);
-            res.write(\r\n);
+            res.write(`\r\n`);
           } catch (e) {
             clients.delete(res);
             try { res.end(); } catch (er) {}
@@ -68,7 +68,7 @@ wss.on("connection", (ws, req) => {
         // <<< auto-start stream immediately after handshake
         try {
           ws.send(JSON.stringify({ cmd: "start_stream" }));
-          console.log(sent start_stream to ${json.deviceId});
+          console.log(`sent start_stream to ${json.deviceId}`);
         } catch (e) {
           console.error("failed to send start_stream:", e && e.message ? e.message : e);
         }
@@ -79,7 +79,7 @@ wss.on("connection", (ws, req) => {
         if (ws.deviceId) {
           const buf = Buffer.from(json.data, "base64");
           lastFrame.set(ws.deviceId, buf);
-          console.log(base64 frame stored for ${ws.deviceId}, ${buf.length} bytes);
+          console.log(`base64 frame stored for ${ws.deviceId}, ${buf.length} bytes`);
         }
         return;
       }
@@ -92,9 +92,9 @@ wss.on("connection", (ws, req) => {
     if (ws.deviceId) {
       devices.delete(ws.deviceId);
       lastFrame.delete(ws.deviceId);
-      console.log(Device disconnected: ${ws.deviceId} (code=${code} reason=${reason}));
+      console.log(`Device disconnected: ${ws.deviceId} (code=${code} reason=${reason})`);
     } else {
-      console.log(WS closed (no deviceId) code=${code} reason=${reason});
+      console.log(`WS closed (no deviceId) code=${code} reason=${reason}`);
     }
   });
 
@@ -123,15 +123,15 @@ app.get("/stream/:id", (req, res) => {
 
   const l = lastFrame.get(id);
   if (l) {
-    res.write(--frame\r\n);
-    res.write(Content-Type: image/jpeg\r\n);
-    res.write(Content-Length: ${l.length}\r\n\r\n);
+    res.write(`--frame\r\n`);
+    res.write(`Content-Type: image/jpeg\r\n`);
+    res.write(`Content-Length: ${l.length}\r\n\r\n`);
     res.write(l);
-    res.write(\r\n);
+    res.write(`\r\n`);
   } else {
     const ws = devices.get(id);
     if (ws && ws.readyState === WebSocket.OPEN) {
-      console.log(requesting immediate capture from ${id});
+      console.log(`requesting immediate capture from ${id}`);
       ws.send(JSON.stringify({ cmd: "capture_now" }));
     }
   }
@@ -188,11 +188,11 @@ app.post("/api/device/:id/stream", (req, res) => {
 
   if (action === "start") {
     ws.send(JSON.stringify({ cmd: "start_stream" }));
-    console.log(asked ${id} to start_stream);
+    console.log(`asked ${id} to start_stream`);
     return res.json({ ok: true, started: true });
   } else if (action === "stop") {
     ws.send(JSON.stringify({ cmd: "stop_stream" }));
-    console.log(asked ${id} to stop_stream);
+    console.log(`asked ${id} to stop_stream`);
     return res.json({ ok: true, stopped: true });
   } else {
     return res.status(400).json({ error: "invalid_action" });
