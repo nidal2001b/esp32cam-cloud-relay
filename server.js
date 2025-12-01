@@ -1,6 +1,5 @@
-// server.js
-// Relay server: Firebase listener + SendGrid OTP + WebSocket relay
-// Required env vars: SENDGRID_API_KEY, FROM_EMAIL, FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL
+// server.js  (updated)
+// Requires env vars: SENDGRID_API_KEY, FROM_EMAIL, FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL
 
 const fs = require('fs');
 const http = require('http');
@@ -17,13 +16,13 @@ const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 const DB_URL = process.env.FIREBASE_DATABASE_URL;
 
 if (!SENDGRID_API_KEY || !FROM_EMAIL || !SERVICE_ACCOUNT_JSON || !DB_URL) {
-  console.error('Missing required env vars: SENDGRID_API_KEY, FROM_EMAIL, FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL');
+  console.error('Missing required env vars. Exiting.');
   process.exit(1);
 }
 
 sgMail.setApiKey(SENDGRID_API_KEY);
 
-// Initialize Firebase Admin
+// Parse service account JSON (accept either raw JSON string or path)
 let serviceAccount;
 try {
   if (SERVICE_ACCOUNT_JSON.trim().startsWith('{')) {
@@ -40,25 +39,32 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: DB_URL
 });
-
 const db = admin.database();
 
-// In-memory stores
 const sessions = new Map(); // deviceId -> { token, email, expiresAt }
-const clients = new Map();  // deviceId -> ws (camera)
-const viewers = new Map();  // deviceId -> Set(ws) (viewers)
+const clients = new Map();  // deviceId -> ws
+const viewers = new Map();  // deviceId -> Set(ws)
 
 const app = express();
 app.use(bodyParser.json());
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => res.json({ ok:true }));
 
-// register_device (camera posts this after connecting to WiFi)
+// debugging: list connected clients
+app.get('/clients', (req, res) => {
+  try {
+    const keys = Array.from(clients.keys());
+    return res.json({ ok:true, clients: keys });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
+// register_device
 app.post('/register_device', async (req, res) => {
   const { deviceId, email, ssid } = req.body || {};
   if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId,email required' });
   try {
-    const ref = db.ref(`/devices/${deviceId}/config`);
-    await ref.update({ email, ssid, registeredAt: Date.now() });
+    await db.ref(`/devices/${deviceId}/config`).update({ email, ssid, registeredAt: Date.now() });
     console.log('Registered device', deviceId, email);
     return res.json({ ok:true });
   } catch (e) {
@@ -67,13 +73,13 @@ app.post('/register_device', async (req, res) => {
   }
 });
 
-// request_otp - convenience endpoint (writes otp_request to Firebase)
+// request_otp
 app.post('/request_otp', async (req, res) => {
   const { deviceId, email } = req.body || {};
   if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId,email required' });
   try {
     await db.ref(`/devices/${deviceId}/live/otp_request`).set({ email, timestamp: Date.now(), status: 'pending' });
-    console.log('OTP request written for', deviceId, email);
+    console.log('OTP request saved for', deviceId, email);
     return res.json({ ok:true });
   } catch (e) {
     console.error('request_otp error', e);
@@ -81,13 +87,13 @@ app.post('/request_otp', async (req, res) => {
   }
 });
 
-// verify_otp - convenience endpoint (writes otp_verify to Firebase)
+// verify_otp
 app.post('/verify_otp', async (req, res) => {
   const { deviceId, email, otp } = req.body || {};
   if (!deviceId || !email || !otp) return res.status(400).json({ ok:false, error:'deviceId,email,otp required' });
   try {
     await db.ref(`/devices/${deviceId}/live/otp_verify`).set({ email, otp, timestamp: Date.now(), status: 'pending' });
-    console.log('OTP verify request written for', deviceId, email);
+    console.log('OTP verify saved for', deviceId, email);
     return res.json({ ok:true });
   } catch (e) {
     console.error('verify_otp error', e);
@@ -95,15 +101,13 @@ app.post('/verify_otp', async (req, res) => {
   }
 });
 
-// command endpoint - forward cmd to camera (requires valid session)
+// command endpoint
 app.post('/command', async (req, res) => {
   const { deviceId, email, token, cmd } = req.body || {};
   if (!deviceId || !email || !token || !cmd) return res.status(400).json({ ok:false, error:'missing' });
 
-  // quick memory check
   let sess = sessions.get(deviceId);
   if (!sess || sess.email !== email || sess.token !== token || Date.now() > sess.expiresAt) {
-    // fallback to DB
     try {
       const snap = await db.ref(`/devices/${deviceId}/live/session`).once('value');
       const dbSess = snap.val();
@@ -114,7 +118,7 @@ app.post('/command', async (req, res) => {
         return res.status(403).json({ ok:false, error:'invalid session' });
       }
     } catch (e) {
-      console.error('Error while validating session from DB:', e);
+      console.error('Error validating session from DB:', e);
       return res.status(500).json({ ok:false, error:'internal' });
     }
   }
@@ -128,12 +132,12 @@ app.post('/command', async (req, res) => {
     console.log(`Forwarded command ${cmd} to camera ${deviceId}`);
     return res.json({ ok:true });
   } catch (e) {
-    console.error('Error sending command to camera', e);
+    console.error('Error sending command', e);
     return res.status(500).json({ ok:false, error: String(e) });
   }
 });
 
-// push_session - read session from DB and push auth_grant to camera if connected
+// push_session - push session to connected camera
 app.post('/push_session', async (req, res) => {
   const { deviceId } = req.body || {};
   if (!deviceId) return res.status(400).json({ ok:false, error:'deviceId required' });
@@ -157,25 +161,22 @@ app.post('/push_session', async (req, res) => {
   }
 });
 
-// create server + ws
+// HTTP server + WebSocket server on same port, path '/ws'
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-// WebSocket message handling
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => ws.isAlive = true);
 
   ws.on('message', (msg) => {
-    (async function handleMessage() {
+    (async function handle() {
       try {
         if (typeof msg === 'string') {
-          // debug print
-          try { console.log('WS text received:', msg); } catch(e){}
-
+          console.log('WS text received:', msg);
           let obj;
           try { obj = JSON.parse(msg); } catch (e) {
-            console.log('WS: invalid JSON text message:', e);
+            console.log('Invalid JSON from ws:', e);
             return;
           }
 
@@ -187,19 +188,13 @@ wss.on('connection', (ws, req) => {
               clients.set(obj.deviceId, ws);
               console.log(`Camera connected (hello): ${obj.deviceId}`);
 
-              // check DB for existing session and push auth_grant if present
+              // check DB session and push auth_grant if exists
               try {
                 const sessSnap = await db.ref(`/devices/${obj.deviceId}/live/session`).once('value');
                 const sess = sessSnap.val();
                 if (sess && sess.token && sess.email && sess.expiresAt && Date.now() < (sess.expiresAt || 0)) {
                   const ttl = Math.max(0, sess.expiresAt - Date.now());
-                  const payload = {
-                    type: 'auth_grant',
-                    deviceId: obj.deviceId,
-                    email: sess.email,
-                    token: sess.token,
-                    ttl_ms: ttl
-                  };
+                  const payload = { type:'auth_grant', deviceId: obj.deviceId, email: sess.email, token: sess.token, ttl_ms: ttl };
                   try {
                     ws.send(JSON.stringify(payload));
                     console.log(`Pushed stored auth_grant to camera ${obj.deviceId} (session from DB).`);
@@ -211,9 +206,8 @@ wss.on('connection', (ws, req) => {
                   console.log(`No valid stored session in DB for ${obj.deviceId} (or expired).`);
                 }
               } catch (e) {
-                console.error('Error while checking/pushing stored session to camera:', e);
+                console.error('Error checking session after hello:', e);
               }
-
             } else if (obj.role === 'viewer') {
               let s = viewers.get(obj.deviceId);
               if (!s) { s = new Set(); viewers.set(obj.deviceId, s); }
@@ -226,7 +220,7 @@ wss.on('connection', (ws, req) => {
             if (cam && cam.readyState === WebSocket.OPEN) cam.send(JSON.stringify(obj));
             return;
           } else if (obj.type === 'auth_grant' && ws.role === 'camera') {
-            console.log('Camera auth_grant ack or message:', obj);
+            console.log('Camera auth_grant ack:', obj);
             return;
           }
         } else {
@@ -236,7 +230,7 @@ wss.on('connection', (ws, req) => {
             if (s) {
               for (const v of s) {
                 if (v.readyState === WebSocket.OPEN) {
-                  try { v.send(msg); } catch(e) {}
+                  try { v.send(msg); } catch (e) {}
                 }
               }
             }
@@ -266,30 +260,25 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// keepalive ping/pong
+// ping/pong keepalive
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
-    try { ws.ping(); } catch(e) {}
+    try { ws.ping(); } catch (e) {}
   });
 }, 30000);
 
 // helpers
-function genOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-function genToken() {
-  return [...Array(32)].map(() => Math.random().toString(36)[2]).join('');
-}
+function genOtp() { return Math.floor(100000 + Math.random()*900000).toString(); }
+function genToken() { return [...Array(32)].map(()=>Math.random().toString(36)[2]).join(''); }
 
-// watch device flows
+// firebase watchers
 function watchDevice(deviceId) {
   console.log('Watching device:', deviceId);
   const otpReqRef = db.ref(`/devices/${deviceId}/live/otp_request`);
   otpReqRef.on('value', async (snap) => {
-    const val = snap.val();
-    if (!val) return;
+    const val = snap.val(); if (!val) return;
     if (val.status && val.status !== 'pending') return;
     if (!val.email) return;
     try {
@@ -297,12 +286,7 @@ function watchDevice(deviceId) {
       const otp = genOtp();
       await db.ref(`/devices/${deviceId}/live/otp_expected`).set(otp);
       await db.ref(`/devices/${deviceId}/live/otp_expected_expiresAt`).set(Date.now() + 5*60*1000);
-      const msg = {
-        to: val.email,
-        from: FROM_EMAIL,
-        subject: `Your OTP for device ${deviceId}`,
-        text: `Your OTP code is ${otp}. It is valid for 5 minutes.`
-      };
+      const msg = { to: val.email, from: FROM_EMAIL, subject: `Your OTP for device ${deviceId}`, text: `Your OTP code is ${otp}. It is valid for 5 minutes.` };
       await sgMail.send(msg);
       console.log(`Sent OTP to ${val.email} for ${deviceId}`);
       await otpReqRef.update({ status: 'sent', sentAt: Date.now() });
@@ -314,39 +298,29 @@ function watchDevice(deviceId) {
 
   const otpVerifyRef = db.ref(`/devices/${deviceId}/live/otp_verify`);
   otpVerifyRef.on('value', async (snap) => {
-    const val = snap.val();
-    if (!val) return;
+    const val = snap.val(); if (!val) return;
     if (val.status && val.status !== 'pending') return;
     if (!val.otp || !val.email) return;
     try {
       await otpVerifyRef.update({ status: 'processing' });
       const expected = (await db.ref(`/devices/${deviceId}/live/otp_expected`).once('value')).val();
       const expiresAt = (await db.ref(`/devices/${deviceId}/live/otp_expected_expiresAt`).once('value')).val() || 0;
-      if (!expected) {
-        await otpVerifyRef.update({ status: 'failed', error: 'no expected otp' });
-        return;
-      }
-      if (Date.now() > expiresAt) {
-        await otpVerifyRef.update({ status: 'failed', error: 'otp expired' });
-        return;
-      }
-      if (String(val.otp) !== String(expected)) {
-        await otpVerifyRef.update({ status: 'failed', error: 'invalid otp' });
-        return;
-      }
+      if (!expected) { await otpVerifyRef.update({ status: 'failed', error: 'no expected otp' }); return; }
+      if (Date.now() > expiresAt) { await otpVerifyRef.update({ status: 'failed', error: 'otp expired' }); return; }
+      if (String(val.otp) !== String(expected)) { await otpVerifyRef.update({ status: 'failed', error: 'invalid otp' }); return; }
+
       const token = genToken();
-      const ttl = 30 * 60 * 1000; // 30 minutes
+      const ttl = 30*60*1000;
       const expiresAtSession = Date.now() + ttl;
       await db.ref(`/devices/${deviceId}/live/session`).set({ token, email: val.email, expiresAt: expiresAtSession });
       await db.ref(`/devices/${deviceId}/live/otp_expected`).remove();
       await db.ref(`/devices/${deviceId}/live/otp_expected_expiresAt`).remove();
       await otpVerifyRef.update({ status: 'ok', grantedAt: Date.now() });
-      await db.ref(`/devices/${deviceId}/live/logs/${Date.now()}`).set({ event: 'session_created', email: val.email });
+      await db.ref(`/devices/${deviceId}/live/logs/${Date.now()}`).set({ event:'session_created', email: val.email });
       sessions.set(deviceId, { token, email: val.email, expiresAt: expiresAtSession });
 
-      // push auth_grant to camera if connected
       const cam = clients.get(deviceId);
-      const payload = { type: 'auth_grant', deviceId, email: val.email, token, ttl_ms: ttl };
+      const payload = { type:'auth_grant', deviceId, email: val.email, token, ttl_ms: ttl };
       if (cam && cam.readyState === WebSocket.OPEN) {
         cam.send(JSON.stringify(payload));
         console.log('Pushed auth_grant to camera', deviceId);
@@ -360,12 +334,8 @@ function watchDevice(deviceId) {
   });
 }
 
-// Watch existing devices and child_added
 const devicesRef = db.ref('/devices');
-devicesRef.on('child_added', (snap) => {
-  const deviceId = snap.key;
-  watchDevice(deviceId);
-});
+devicesRef.on('child_added', snap => { watchDevice(snap.key); });
 
 (async () => {
   try {
