@@ -1,366 +1,205 @@
 // server.js
-// Relay server: Firebase + SendGrid OTP + WebSocket relay
-// Expects env vars: SENDGRID_API_KEY, FROM_EMAIL, FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL
-
-const fs = require('fs');
-const http = require('http');
-const express = require('express');
-const bodyParser = require('body-parser');
-const admin = require('firebase-admin');
-const WebSocket = require('ws');
-const sgMail = require('@sendgrid/mail');
-
-const PORT = process.env.PORT || 10000;
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
-const FROM_EMAIL = process.env.FROM_EMAIL;
-const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-const DB_URL = process.env.FIREBASE_DATABASE_URL;
-
-if (!SENDGRID_API_KEY || !FROM_EMAIL || !SERVICE_ACCOUNT_JSON || !DB_URL) {
-  console.error('Missing required env vars: SENDGRID_API_KEY, FROM_EMAIL, FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_DATABASE_URL');
-  process.exit(1);
-}
-
-sgMail.setApiKey(SENDGRID_API_KEY);
-
-// parse service account JSON (accept raw JSON string or path)
-let serviceAccount;
-try {
-  if (SERVICE_ACCOUNT_JSON.trim().startsWith('{')) {
-    serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
-  } else {
-    // assume it's a path
-    serviceAccount = require(SERVICE_ACCOUNT_JSON);
-  }
-} catch (e) {
-  console.error('Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON:', e);
-  process.exit(1);
-}
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: DB_URL
-});
-
-const db = admin.database();
-
-// in-memory maps
-const sessions = new Map(); // deviceId -> { token, email, expiresAt }
-const clients = new Map();  // deviceId -> ws (camera)
-const viewers = new Map();  // deviceId -> Set(ws)
+// Complete ESP32-CAM relay server with MJPEG streaming and auto-start on hello
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const bodyParser = require("body-parser");
 
 const app = express();
 app.use(bodyParser.json());
-app.get('/health', (req, res) => res.json({ ok: true }));
 
-// debug: list connected camera ids
-app.get('/clients', (req, res) => {
-  return res.json({ ok: true, clients: Array.from(clients.keys()) });
+app.get("/", (req, res) => {
+  res.send("ESP32-CAM relay running. Use /api/devices or /stream/:id");
 });
 
-// register_device: camera posts deviceId & email after provisioning
-// NOTE: safe update — do not pass undefined into Firebase update()
-app.post('/register_device', async (req, res) => {
-  // debug print incoming body to help trace issues
-  console.log('/register_device payload:', JSON.stringify(req.body));
-
-  const { deviceId, email, ssid } = req.body || {};
-  if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId,email required' });
-  try {
-    // build update object without undefined values
-    const updateObj = { email, registeredAt: Date.now() };
-    if (typeof ssid !== 'undefined' && ssid !== null) updateObj.ssid = ssid;
-
-    await db.ref(/devices/${deviceId}/config).update(updateObj);
-    console.log('Registered device', deviceId, email, 'ssid:', (typeof ssid === 'undefined' ? '(undef)' : ssid));
-    return res.json({ ok:true });
-  } catch (e) {
-    console.error('register_device error', e);
-    return res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-
-// request_otp: write otp_request in DB; watchDevice will handle sending email
-app.post('/request_otp', async (req, res) => {
-  const { deviceId, email } = req.body || {};
-  if (!deviceId || !email) return res.status(400).json({ ok:false, error:'deviceId,email required' });
-  try {
-    await db.ref(/devices/${deviceId}/live/otp_request).set({ email, timestamp: Date.now(), status: 'pending' });
-    console.log('OTP request written for', deviceId, email);
-    return res.json({ ok:true });
-  } catch (e) {
-    console.error('request_otp error', e);
-    return res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-
-// verify_otp: write otp_verify in DB; watchDevice will process it and create session
-app.post('/verify_otp', async (req, res) => {
-  const { deviceId, email, otp } = req.body || {};
-  if (!deviceId || !email || !otp) return res.status(400).json({ ok:false, error:'deviceId,email,otp required' });
-  try {
-    await db.ref(/devices/${deviceId}/live/otp_verify).set({ email, otp, timestamp: Date.now(), status: 'pending' });
-    console.log('OTP verify request written for', deviceId, email);
-    return res.json({ ok:true });
-  } catch (e) {
-    console.error('verify_otp error', e);
-    return res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-
-// command: forward start/stop/capture commands to camera (requires valid session)
-app.post('/command', async (req, res) => {
-  const { deviceId, email, token, cmd } = req.body || {};
-  if (!deviceId || !email || !token || !cmd) return res.status(400).json({ ok:false, error:'missing' });
-
-  // quick in-memory check
-  let sess = sessions.get(deviceId);
-  if (!sess || sess.email !== email || sess.token !== token || Date.now() > sess.expiresAt) {
-    try {
-      const snap = await db.ref(/devices/${deviceId}/live/session).once('value');
-      const dbSess = snap.val();
-      if (dbSess && dbSess.email === email && dbSess.token === token && Date.now() < (dbSess.expiresAt || 0)) {
-        sessions.set(deviceId, { token: dbSess.token, email: dbSess.email, expiresAt: dbSess.expiresAt });
-        sess = sessions.get(deviceId);
-      } else {
-        return res.status(403).json({ ok:false, error:'invalid session' });
-      }
-    } catch (e) {
-      console.error('Error while validating session from DB:', e);
-      return res.status(500).json({ ok:false, error:'internal' });
-    }
-  }
-
-  const cam = clients.get(deviceId);
-  if (!cam || cam.readyState !== WebSocket.OPEN) {
-    return res.status(500).json({ ok:false, error:'camera not connected' });
-  }
-
-  try {
-    cam.send(JSON.stringify({ type:'cmd', payload:{ cmd, email, token } }));
-    console.log(Forwarded command ${cmd} to camera ${deviceId});
-    return res.json({ ok:true });
-  } catch (e) {
-    console.error('Error sending command to camera', e);
-    return res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-
-// push_session: read session from DB and push auth_grant (with start:true) if camera connected
-app.post('/push_session', async (req, res) => {
-  const { deviceId } = req.body || {};
-  if (!deviceId) return res.status(400).json({ ok:false, error:'deviceId required' });
-  try {
-    const snap = await db.ref(/devices/${deviceId}/live/session).once('value');
-    const sess = snap.val();
-    if (!sess || !sess.token) return res.status(404).json({ ok:false, error:'no session in DB' });
-    const cam = clients.get(deviceId);
-    if (!cam || cam.readyState !== WebSocket.OPEN) {
-      return res.status(500).json({ ok:false, error:'camera not connected' });
-    }
-    const ttl = Math.max(0, (sess.expiresAt || 0) - Date.now());
-    const payload = { type:'auth_grant', deviceId, email: sess.email, token: sess.token, ttl_ms: ttl, start: true };
-    cam.send(JSON.stringify(payload));
-    sessions.set(deviceId, { token: sess.token, email: sess.email, expiresAt: sess.expiresAt });
-    console.log(Pushed session on-demand to camera ${deviceId});
-    return res.json({ ok:true });
-  } catch (e) {
-    console.error('push_session error', e);
-    return res.status(500).json({ ok:false, error: String(e) });
-  }
-});
-
-// create HTTP + WS
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: '/ws' });
+const wss = new WebSocket.Server({ noServer: true, path: "/ws" });
 
-// WS handling
-wss.on('connection', (ws, req) => {
+const devices = new Map();      // deviceId -> ws
+const lastFrame = new Map();    // deviceId -> Buffer (last jpeg)
+const streamClients = new Map(); // deviceId -> Set<res>
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on("connection", (ws, req) => {
   ws.isAlive = true;
-  ws.on('pong', () => ws.isAlive = true);
+  ws.on("pong", () => (ws.isAlive = true));
 
-  ws.on('message', (msg) => {
-    (async function handleMessage() {
-      try {
-        if (typeof msg === 'string') {
-          console.log('WS text received:', msg);
-          let obj;
-          try { obj = JSON.parse(msg); } catch (e) {
-            console.log('WS: invalid JSON text message:', e);
-            return;
-          }
-
-          if (obj.type === 'hello' && obj.deviceId && obj.role) {
-            ws.deviceId = obj.deviceId;
-            ws.role = obj.role;
-
-            if (obj.role === 'camera') {
-              clients.set(obj.deviceId, ws);
-              console.log(Camera connected (hello): ${obj.deviceId});
-
-              // check DB for existing session and push auth_grant+start if exists
-              try {
-                const sessSnap = await db.ref(/devices/${obj.deviceId}/live/session).once('value');
-                const sess = sessSnap.val();
-                if (sess && sess.token && sess.email && sess.expiresAt && Date.now() < (sess.expiresAt || 0)) {
-                  const ttl = Math.max(0, sess.expiresAt - Date.now());
-                  const payload = { type:'auth_grant', deviceId: obj.deviceId, email: sess.email, token: sess.token, ttl_ms: ttl, start: true };
-                  ws.send(JSON.stringify(payload));
-                  console.log(Pushed stored auth_grant+start to camera ${obj.deviceId});
-                  sessions.set(obj.deviceId, { token: sess.token, email: sess.email, expiresAt: sess.expiresAt });
-                } else {
-                  console.log(No valid stored session in DB for ${obj.deviceId} (or expired).);
-                }
-              } catch (e) {
-                console.error('Error while checking/pushing stored session to camera:', e);
-              }
-
-            } else if (obj.role === 'viewer') {
-              let s = viewers.get(obj.deviceId);
-              if (!s) { s = new Set(); viewers.set(obj.deviceId, s); }
-              s.add(ws);
-              console.log(Viewer connected for ${obj.deviceId});
-            }
-            return;
-          } else if (obj.type === 'control' && ws.role === 'viewer') {
-            const cam = clients.get(obj.deviceId);
-            if (cam && cam.readyState === WebSocket.OPEN) cam.send(JSON.stringify(obj));
-            return;
-          } else if (obj.type === 'auth_grant' && ws.role === 'camera') {
-            console.log('Camera auth_grant ack or message:', obj);
-            return;
-          }
-        } else {
-          // binary frames from camera -> forward to viewers
-          if (ws.role === 'camera' && ws.deviceId) {
-            const s = viewers.get(ws.deviceId);
-            if (s) {
-              for (const v of s) {
-                if (v.readyState === WebSocket.OPEN) {
-                  try { v.send(msg); } catch(e) {}
-                }
-              }
-            }
+  ws.on("message", (msg, isBinary) => {
+    if (isBinary) {
+      if (!ws.deviceId) return;
+      const buf = Buffer.from(msg);
+      lastFrame.set(ws.deviceId, buf);
+      console.log(binary frame received from ${ws.deviceId}, ${buf.length} bytes);
+      const clients = streamClients.get(ws.deviceId);
+      if (clients) {
+        for (const res of Array.from(clients)) {
+          try {
+            res.write(--frame\r\n);
+            res.write(Content-Type: image/jpeg\r\n);
+            res.write(Content-Length: ${buf.length}\r\n\r\n);
+            res.write(buf);
+            res.write(\r\n);
+          } catch (e) {
+            clients.delete(res);
+            try { res.end(); } catch (er) {}
           }
         }
-      } catch (e) {
-        console.error('Error in WS message handler:', e);
       }
-    })();
-  });
+      return;
+    }
 
-  ws.on('close', () => {
-    if (ws.role === 'camera' && ws.deviceId) {
-      const mapped = clients.get(ws.deviceId);
-      if (mapped === ws) {
-        clients.delete(ws.deviceId);
-        console.log('Camera disconnected', ws.deviceId);
+    try {
+      const json = JSON.parse(msg.toString());
+      if (json.type === "hello" && json.deviceId) {
+        ws.deviceId = json.deviceId;
+        devices.set(json.deviceId, ws);
+        console.log("Device connected:", json.deviceId);
+        ws.send(JSON.stringify({ type: "hello_ack" }));
+
+        // <<< auto-start stream immediately after handshake
+        try {
+          ws.send(JSON.stringify({ cmd: "start_stream" }));
+          console.log(sent start_stream to ${json.deviceId});
+        } catch (e) {
+          console.error("failed to send start_stream:", e && e.message ? e.message : e);
+        }
+        return;
       }
-    } else if (ws.role === 'viewer' && ws.deviceId) {
-      const s = viewers.get(ws.deviceId);
-      if (s) s.delete(ws);
+
+      if (json.type === "frame" && json.reqId && json.data) {
+        if (ws.deviceId) {
+          const buf = Buffer.from(json.data, "base64");
+          lastFrame.set(ws.deviceId, buf);
+          console.log(base64 frame stored for ${ws.deviceId}, ${buf.length} bytes);
+        }
+        return;
+      }
+    } catch (e) {
+      console.error("Invalid WS message:", e);
     }
   });
 
-  ws.on('error', (err) => {
-    console.error('WS socket error:', err);
+  ws.on("close", (code, reason) => {
+    if (ws.deviceId) {
+      devices.delete(ws.deviceId);
+      lastFrame.delete(ws.deviceId);
+      console.log(Device disconnected: ${ws.deviceId} (code=${code} reason=${reason}));
+    } else {
+      console.log(WS closed (no deviceId) code=${code} reason=${reason});
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error("WS error:", err && err.message ? err.message : err);
   });
 });
 
-// ping/pong keepalive
 setInterval(() => {
-  wss.clients.forEach(ws => {
+  wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
-    try { ws.ping(); } catch(e) {}
+    ws.ping(() => {});
   });
 }, 30000);
 
-// helpers
-function genOtp() { return Math.floor(100000 + Math.random()*900000).toString(); }
-function genToken() { return [...Array(32)].map(()=>Math.random().toString(36)[2]).join(''); }
-
-// watch device flows (send OTP, verify)
-function watchDevice(deviceId) {
-  console.log('Watching device:', deviceId);
-  const otpReqRef = db.ref(/devices/${deviceId}/live/otp_request);
-  otpReqRef.on('value', async (snap) => {
-    const val = snap.val();
-    if (!val) return;
-    if (val.status && val.status !== 'pending') return;
-    if (!val.email) return;
-    try {
-      await otpReqRef.update({ status: 'processing' });
-      const otp = genOtp();
-      await db.ref(/devices/${deviceId}/live/otp_expected).set(otp);
-      await db.ref(/devices/${deviceId}/live/otp_expected_expiresAt).set(Date.now() + 5*60*1000);
-      const msg = { to: val.email, from: FROM_EMAIL, subject: Your OTP for device ${deviceId}, text: Your OTP code is ${otp}. It is valid for 5 minutes. };
-      await sgMail.send(msg);
-      console.log(Sent OTP to ${val.email} for ${deviceId});
-      await otpReqRef.update({ status: 'sent', sentAt: Date.now() });
-    } catch (e) {
-      console.error('Failed to process otp_request', e);
-      try { await otpReqRef.update({ status: 'error', error: String(e) }); } catch(e2){}
-    }
+/* MJPEG stream endpoint */
+app.get("/stream/:id", (req, res) => {
+  const id = req.params.id;
+  res.writeHead(200, {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+    "Connection": "keep-alive"
   });
 
-  const otpVerifyRef = db.ref(/devices/${deviceId}/live/otp_verify);
-  otpVerifyRef.on('value', async (snap) => {
-    const val = snap.val();
-    if (!val) return;
-    if (val.status && val.status !== 'pending') return;
-    if (!val.otp || !val.email) return;
-    try {
-      await otpVerifyRef.update({ status: 'processing' });
-      const expected = (await db.ref(/devices/${deviceId}/live/otp_expected).once('value')).val();
-      const expiresAt = (await db.ref(/devices/${deviceId}/live/otp_expected_expiresAt).once('value')).val() || 0;
-      if (!expected) { await otpVerifyRef.update({ status: 'failed', error: 'no expected otp' }); return; }
-      if (Date.now() > expiresAt) { await otpVerifyRef.update({ status: 'failed', error: 'otp expired' }); return; }
-      if (String(val.otp) !== String(expected)) { await otpVerifyRef.update({ status: 'failed', error: 'invalid otp' }); return; }
-
-      // success -> create session
-      const token = genToken();
-      const ttl = 30 * 60 * 1000; // 30 minutes
-      const expiresAtSession = Date.now() + ttl;
-      await db.ref(/devices/${deviceId}/live/session).set({ token, email: val.email, expiresAt: expiresAtSession });
-      await db.ref(/devices/${deviceId}/live/otp_expected).remove();
-      await db.ref(/devices/${deviceId}/live/otp_expected_expiresAt).remove();
-      await otpVerifyRef.update({ status: 'ok', grantedAt: Date.now() });
-      await db.ref(/devices/${deviceId}/live/logs/${Date.now()}).set({ event: 'session_created', email: val.email });
-      sessions.set(deviceId, { token, email: val.email, expiresAt: expiresAtSession });
-
-      // push auth_grant + start if camera connected now
-      const cam = clients.get(deviceId);
-      const payload = { type: 'auth_grant', deviceId, email: val.email, token, ttl_ms: ttl, start: true };
-      if (cam && cam.readyState === WebSocket.OPEN) {
-        cam.send(JSON.stringify(payload));
-        console.log('Pushed auth_grant + start to camera', deviceId);
-      } else {
-        console.log('Camera not connected; session stored in DB for later.');
-      }
-    } catch (e) {
-      console.error('Error in otp_verify flow', e);
-      try { await otpVerifyRef.update({ status: 'error', error: String(e) }); } catch(e2){}
+  const l = lastFrame.get(id);
+  if (l) {
+    res.write(--frame\r\n);
+    res.write(Content-Type: image/jpeg\r\n);
+    res.write(Content-Length: ${l.length}\r\n\r\n);
+    res.write(l);
+    res.write(\r\n);
+  } else {
+    const ws = devices.get(id);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log(requesting immediate capture from ${id});
+      ws.send(JSON.stringify({ cmd: "capture_now" }));
     }
-  });
-}
+  }
 
-const devicesRef = db.ref('/devices');
-devicesRef.on('child_added', (snap) => {
-  const deviceId = snap.key;
-  watchDevice(deviceId);
+  if (!streamClients.has(id)) streamClients.set(id, new Set());
+  const clients = streamClients.get(id);
+  clients.add(res);
+
+  req.on("close", () => {
+    clients.delete(res);
+  });
 });
 
-(async () => {
-  try {
-    const list = await devicesRef.once('value');
-    const v = list.val() || {};
-    Object.keys(v).forEach(deviceId => watchDevice(deviceId));
-  } catch (e) {
-    console.error('Initial device listing failed', e);
-  }
-})();
+/* API endpoints */
+app.get("/api/devices", (req, res) => {
+  res.json({ online: Array.from(devices.keys()) });
+});
 
+app.post("/api/device/:id/capture", (req, res) => {
+  const id = req.params.id;
+  const ws = devices.get(id);
+  const cached = lastFrame.get(id);
+  if (cached) {
+    res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": cached.length });
+    return res.end(cached);
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return res.status(404).json({ error: "device_offline" });
+  }
+
+  ws.send(JSON.stringify({ cmd: "capture_now" }));
+
+  const start = Date.now();
+  const timeoutMs = 6000;
+  const interval = setInterval(() => {
+    const f = lastFrame.get(id);
+    if (f && f.length > 0) {
+      clearInterval(interval);
+      res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": f.length });
+      return res.end(f);
+    }
+    if (Date.now() - start > timeoutMs) {
+      clearInterval(interval);
+      return res.status(504).json({ error: "timeout" });
+    }
+  }, 250);
+});
+
+app.post("/api/device/:id/stream", (req, res) => {
+  const id = req.params.id;
+  const action = (req.query.action || "").toLowerCase();
+  const ws = devices.get(id);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return res.status(404).json({ error: "device_offline" });
+
+  if (action === "start") {
+    ws.send(JSON.stringify({ cmd: "start_stream" }));
+    console.log(asked ${id} to start_stream);
+    return res.json({ ok: true, started: true });
+  } else if (action === "stop") {
+    ws.send(JSON.stringify({ cmd: "stop_stream" }));
+    console.log(asked ${id} to stop_stream);
+    return res.json({ ok: true, stopped: true });
+  } else {
+    return res.status(400).json({ error: "invalid_action" });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(HTTP + WS server listening on port ${PORT});
+  console.log("Server running on port", PORT);
 });
