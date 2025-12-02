@@ -11,6 +11,6 @@
     "ws": "^8.16.0",
     "body-parser": "^1.20.2",
     "firebase-admin": "^11.11.0",
-    "@sendgrid/mail": "^7.9.0"
+    "@sendgrid/mail": "^7.7.0"
   }
 }
