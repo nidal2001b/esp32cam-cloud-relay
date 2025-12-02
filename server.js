@@ -1,5 +1,6 @@
 // server.js
 // ESP32-CAM relay server with Firebase RTDB + SendGrid + OTP + JWT + revoke support
+// Uses hashed token keys for revokedSessions (SHA-256 hex) to avoid invalid RTDB paths.
 
 const express = require("express");
 const http = require("http");
@@ -9,6 +10,7 @@ const admin = require("firebase-admin");
 const sgMail = require("@sendgrid/mail");
 const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
 // ============================
 // Load ENV
@@ -88,8 +90,12 @@ const lastFrame = new Map(); // deviceId -> latest frame buffer
 const streamClients = new Map(); // deviceId -> Set<res>
 
 // ============================
-// JWT helpers & revocation
+// Helpers: tokenKey (SHA-256) and JWT helpers
 // ============================
+function tokenKey(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
 function signSessionToken(deviceId, email) {
   const payload = { sub: deviceId, email: email || "" };
   return jwt.sign(payload, JWT_SECRET || "change_me", { expiresIn: JWT_EXPIRES_SEC });
@@ -98,12 +104,13 @@ function signSessionToken(deviceId, email) {
 async function isTokenRevoked(token) {
   if (!token) return true;
   try {
-    const key = encodeURIComponent(token);
+    const key = tokenKey(token);
     const snap = await rtdb.ref(`revokedSessions/${key}`).get();
     return snap.exists();
   } catch (e) {
     console.error("isTokenRevoked error:", e);
-    // on DB failure, be conservative? here we return false to avoid locking out if DB transient fails.
+    // on DB transient failure we choose to allow (return false) to avoid locking out users;
+    // adjust to `true` if you prefer conservative behavior.
     return false;
   }
 }
@@ -149,7 +156,7 @@ async function cleanupRevokedSessions() {
     console.error("cleanupRevokedSessions error:", e);
   }
 }
-cleanupRevokedSessions().catch(()=>{});
+cleanupRevokedSessions().catch(() => {});
 
 // ============================
 // WebSocket Upgrade & handlers
@@ -372,7 +379,7 @@ app.post("/api/device/:id/revoke", verifySessionMiddleware, async (req, res) => 
       if (decoded && decoded.exp) expiresAt = decoded.exp * 1000;
     } catch (e) {}
 
-    await rtdb.ref(`revokedSessions/${encodeURIComponent(token)}`).set({
+    await rtdb.ref(`revokedSessions/${tokenKey(token)}`).set({
       revokedAt: Date.now(),
       expiresAt,
       deviceId: id
